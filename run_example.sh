@@ -5,7 +5,7 @@
 
 echo "Starting audio separation process..."
 echo "Input file: sounds-examples/2025-10-25 13.54.36.ogg"
-echo ""
+echo "" 
 
 # Activate virtual environment and run the audio separator with visualization
 source venv/bin/activate
