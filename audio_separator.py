@@ -60,22 +60,72 @@ class AudioSeparator:
         return features
     
     def detect_erator_sounds(self, audio, features, threshold_percentile=75):
-        """Detect erator sounds based on characteristic features."""
-        # Erator sounds typically have:
-        # - High zero crossing rate (mechanical noise)
-        # - Specific frequency characteristics
-        # - Higher energy in certain frequency bands
+        """Automatically detect erator ON/OFF states based on audio characteristics."""
+        # Analyze frequency content to detect erator states
+        hop_length = 512
+        stft = librosa.stft(audio, hop_length=hop_length)
+        magnitude = np.abs(stft)
+        freqs = librosa.fft_frequencies(sr=self.sample_rate)
         
-        # Calculate zero crossing rate threshold
-        zcr_threshold = np.percentile(features[:, 2], threshold_percentile)
+        # Define frequency bands for different sound types
+        low_freq_mask = (freqs >= 50) & (freqs <= 200)      # Water/background
+        mid_freq_mask = (freqs >= 200) & (freqs <= 1000)    # Mixed sounds
+        high_freq_mask = (freqs >= 1000) & (freqs <= 5000)  # Erator mechanical noise
         
-        # Calculate energy threshold
-        energy_threshold = np.percentile(features[:, 3], threshold_percentile)
+        # Calculate energy in each frequency band over time
+        low_energy = np.sum(magnitude[low_freq_mask, :], axis=0)
+        mid_energy = np.sum(magnitude[mid_freq_mask, :], axis=0)
+        high_energy = np.sum(magnitude[high_freq_mask, :], axis=0)
         
-        # Detect erator segments
-        erator_mask = (features[:, 2] > zcr_threshold) & (features[:, 3] > energy_threshold)
+        # Calculate energy ratios to identify erator characteristics
+        # Erator typically has high mid+high frequency energy relative to low frequency
+        total_energy = low_energy + mid_energy + high_energy
+        erator_ratio = (mid_energy + high_energy) / (total_energy + 1e-10)  # Avoid division by zero
         
-        return erator_mask
+        # Use multiple criteria for erator detection
+        # 1. High erator ratio (mechanical noise vs water)
+        ratio_threshold = np.percentile(erator_ratio, threshold_percentile)
+        
+        # 2. Sufficient overall energy (not silence)
+        energy_threshold = np.percentile(total_energy, 20)  # Lower threshold to catch quiet erator
+        
+        # 3. High frequency energy (mechanical noise signature)
+        high_energy_threshold = np.percentile(high_energy, threshold_percentile)
+        
+        # Combine criteria for erator detection
+        erator_mask = (
+            (erator_ratio > ratio_threshold) & 
+            (total_energy > energy_threshold) & 
+            (high_energy > high_energy_threshold)
+        )
+        
+        # Apply temporal smoothing to avoid flickering detection
+        erator_mask = self._smooth_detection(erator_mask, min_duration_frames=5)
+        
+        return erator_mask, {
+            'erator_ratio': erator_ratio,
+            'low_energy': low_energy,
+            'mid_energy': mid_energy,
+            'high_energy': high_energy,
+            'total_energy': total_energy
+        }
+    
+    def _smooth_detection(self, mask, min_duration_frames=5):
+        """Apply temporal smoothing to detection to avoid flickering."""
+        # Remove very short detections
+        smoothed = mask.copy()
+        
+        # Find continuous segments
+        diff = np.diff(np.concatenate([[False], smoothed, [False]]).astype(int))
+        starts = np.where(diff == 1)[0]
+        ends = np.where(diff == -1)[0]
+        
+        # Remove segments shorter than min_duration_frames
+        for start, end in zip(starts, ends):
+            if end - start < min_duration_frames:
+                smoothed[start:end] = False
+        
+        return smoothed
     
     def filter_water_sounds(self, audio, low_freq=100, high_freq=2000):
         """Filter out water sounds using bandpass filtering."""
@@ -134,20 +184,63 @@ class AudioSeparator:
         magnitude = np.abs(stft)
         phase = np.angle(stft)
         
-        # Create mask for erator frequencies
-        # Erator sounds typically have energy in 1-8 kHz range
+        # Create mask for erator frequencies (low frequencies for this case)
         freqs = librosa.fft_frequencies(sr=self.sample_rate)
-        erator_freq_mask = (freqs >= 1000) & (freqs <= 8000)
+        erator_freq_mask = (freqs >= 50) & (freqs <= 500)  # Low frequency erator
         
-        # Apply frequency mask
+        # Apply frequency mask - enhance low frequencies, reduce others
         enhanced_magnitude = magnitude.copy()
-        enhanced_magnitude[~erator_freq_mask, :] *= 0.1  # Reduce non-erator frequencies
+        enhanced_magnitude[erator_freq_mask, :] *= 1.5  # Boost erator frequencies
+        enhanced_magnitude[~erator_freq_mask, :] *= 0.3  # Reduce non-erator frequencies
         
         # Reconstruct audio
         enhanced_stft = enhanced_magnitude * np.exp(1j * phase)
         enhanced_audio = librosa.istft(enhanced_stft)
         
         return enhanced_audio
+    
+    def analyze_erator_states(self, erator_mask, sample_rate):
+        """Analyze erator ON/OFF states and transitions."""
+        hop_length = 512
+        frame_times = librosa.frames_to_time(np.arange(len(erator_mask)), 
+                                           sr=sample_rate, 
+                                           hop_length=hop_length)
+        
+        # Find state transitions
+        diff = np.diff(np.concatenate([[False], erator_mask, [False]]).astype(int))
+        on_times = frame_times[np.where(diff == 1)[0]]
+        off_times = frame_times[np.where(diff == -1)[0]]
+        
+        # Calculate durations
+        durations = []
+        for i in range(len(on_times)):
+            if i < len(off_times):
+                duration = off_times[i] - on_times[i]
+                durations.append(duration)
+        
+        # Print analysis results
+        print(f"\n=== ERATOR STATE ANALYSIS ===")
+        print(f"Total ON periods: {len(on_times)}")
+        print(f"Total OFF periods: {len(off_times)}")
+        
+        if len(on_times) > 0:
+            print(f"\nErator ON periods:")
+            for i, (on_time, off_time) in enumerate(zip(on_times, off_times)):
+                print(f"  Period {i+1}: {on_time:.2f}s - {off_time:.2f}s (duration: {off_time-on_time:.2f}s)")
+        
+        if len(durations) > 0:
+            print(f"\nDuration statistics:")
+            print(f"  Average ON duration: {np.mean(durations):.2f}s")
+            print(f"  Longest ON duration: {np.max(durations):.2f}s")
+            print(f"  Shortest ON duration: {np.min(durations):.2f}s")
+        
+        return {
+            'on_times': on_times,
+            'off_times': off_times,
+            'durations': durations,
+            'total_on_time': np.sum(durations) if durations else 0,
+            'total_off_time': frame_times[-1] - (np.sum(durations) if durations else 0)
+        }
     
     def save_results(self, original_audio, erator_audio, water_audio, enhanced_audio, 
                     output_dir="output"):
@@ -168,35 +261,73 @@ class AudioSeparator:
         print("- water_sounds.wav: Isolated water/background sounds")
         print("- enhanced_erator.wav: Enhanced erator sounds with noise reduction")
     
-    def visualize_separation(self, audio, features, erator_mask, output_dir="output"):
-        """Create visualization of the separation process."""
-        fig, axes = plt.subplots(3, 1, figsize=(15, 10))
+    def visualize_separation(self, audio, features, erator_mask, analysis_data, output_dir="output"):
+        """Create visualization of the automatic separation process."""
+        fig, axes = plt.subplots(5, 1, figsize=(15, 14))
         
-        # Plot 1: Original waveform
+        # Plot 1: Original waveform with erator periods highlighted
         time = np.linspace(0, len(audio)/self.sample_rate, len(audio))
-        axes[0].plot(time, audio, alpha=0.7)
-        axes[0].set_title('Original Audio Waveform')
+        axes[0].plot(time, audio, alpha=0.7, color='blue')
+        axes[0].set_title('Original Audio Waveform with Detected Erator Periods')
         axes[0].set_ylabel('Amplitude')
         axes[0].grid(True)
         
-        # Plot 2: Feature analysis
-        frame_times = librosa.frames_to_time(np.arange(len(features)), 
+        # Highlight detected erator periods
+        hop_length = 512
+        frame_times = librosa.frames_to_time(np.arange(len(erator_mask)), 
                                            sr=self.sample_rate, 
-                                           hop_length=512)
-        axes[1].plot(frame_times, features[:, 2], label='Zero Crossing Rate', alpha=0.7)
-        axes[1].plot(frame_times, features[:, 3], label='RMS Energy', alpha=0.7)
-        axes[1].set_title('Audio Features')
-        axes[1].set_ylabel('Feature Value')
+                                           hop_length=hop_length)
+        
+        # Find continuous erator periods
+        diff = np.diff(np.concatenate([[False], erator_mask, [False]]).astype(int))
+        on_times = frame_times[np.where(diff == 1)[0]]
+        off_times = frame_times[np.where(diff == -1)[0]]
+        
+        for on_time, off_time in zip(on_times, off_times):
+            axes[0].axvspan(on_time, off_time, alpha=0.3, color='red', label='Detected Erator' if on_time == on_times[0] else "")
+        if len(on_times) > 0:
+            axes[0].legend()
+        
+        # Plot 2: Frequency band analysis
+        axes[1].plot(frame_times, analysis_data['low_energy'], label='Low Freq (50-200 Hz)', alpha=0.8, color='blue')
+        axes[1].plot(frame_times, analysis_data['mid_energy'], label='Mid Freq (200-1000 Hz)', alpha=0.8, color='green')
+        axes[1].plot(frame_times, analysis_data['high_energy'], label='High Freq (1000-5000 Hz)', alpha=0.8, color='red')
+        axes[1].set_title('Frequency Band Energy Analysis')
+        axes[1].set_ylabel('Energy')
         axes[1].legend()
         axes[1].grid(True)
         
-        # Plot 3: Erator detection
-        axes[2].plot(frame_times, erator_mask.astype(int), label='Erator Detection', alpha=0.8)
-        axes[2].set_title('Erator Sound Detection')
-        axes[2].set_xlabel('Time (seconds)')
-        axes[2].set_ylabel('Erator Present (1=Yes, 0=No)')
+        # Plot 3: Erator ratio (mechanical vs water signature)
+        axes[2].plot(frame_times, analysis_data['erator_ratio'], label='Erator Ratio (Mid+High)/(Total)', alpha=0.8, color='purple')
+        axes[2].set_title('Erator Signature Ratio (Higher = More Mechanical)')
+        axes[2].set_ylabel('Ratio')
         axes[2].legend()
         axes[2].grid(True)
+        
+        # Plot 4: Audio features
+        frame_times = librosa.frames_to_time(np.arange(len(features)), 
+                                           sr=self.sample_rate, 
+                                           hop_length=512)
+        axes[3].plot(frame_times, features[:, 2], label='Zero Crossing Rate', alpha=0.7)
+        axes[3].plot(frame_times, features[:, 3], label='RMS Energy', alpha=0.7)
+        axes[3].set_title('Audio Features')
+        axes[3].set_ylabel('Feature Value')
+        axes[3].legend()
+        axes[3].grid(True)
+        
+        # Plot 5: Final erator detection
+        axes[4].plot(frame_times, erator_mask.astype(int), label='Erator ON/OFF', alpha=0.8, color='green', linewidth=2)
+        axes[4].set_title('Automatic Erator Detection (ON/OFF States)')
+        axes[4].set_xlabel('Time (seconds)')
+        axes[4].set_ylabel('Erator State (1=ON, 0=OFF)')
+        axes[4].legend()
+        axes[4].grid(True)
+        
+        # Add state transition markers
+        for on_time in on_times:
+            axes[4].axvline(on_time, color='green', linestyle='--', alpha=0.7, label='ON' if on_time == on_times[0] else "")
+        for off_time in off_times:
+            axes[4].axvline(off_time, color='red', linestyle='--', alpha=0.7, label='OFF' if off_time == off_times[0] else "")
         
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, 'separation_analysis.png'), dpi=300, bbox_inches='tight')
@@ -234,9 +365,19 @@ def main():
     print("Extracting features...")
     features = separator.extract_features(audio)
     
-    # Detect erator sounds
-    print("Detecting erator sounds...")
-    erator_mask = separator.detect_erator_sounds(audio, features, args.threshold)
+    # Automatically detect erator sounds (no prior knowledge of timing)
+    print("Automatically detecting erator ON/OFF states...")
+    erator_mask, analysis_data = separator.detect_erator_sounds(audio, features, args.threshold)
+    
+    # Analyze erator states and transitions
+    state_analysis = separator.analyze_erator_states(erator_mask, args.sample_rate)
+    
+    # Print detection statistics
+    erator_frames = np.sum(erator_mask)
+    total_frames = len(erator_mask)
+    print(f"\nOverall detection: {erator_frames}/{total_frames} frames ({erator_frames/total_frames*100:.1f}%)")
+    print(f"Total erator ON time: {state_analysis['total_on_time']:.2f}s")
+    print(f"Total erator OFF time: {state_analysis['total_off_time']:.2f}s")
     
     # Separate sources
     print("Separating audio sources...")
@@ -254,7 +395,7 @@ def main():
     # Create visualization if requested
     if args.visualize:
         print("Creating visualization...")
-        separator.visualize_separation(audio, features, erator_mask, args.output)
+        separator.visualize_separation(audio, features, erator_mask, analysis_data, args.output)
     
     print("Separation complete!")
 

@@ -1,13 +1,14 @@
 #!/bin/bash
 
 # Example script to run audio separation on the provided audio file
-# Make sure to install dependencies first: pip install -r requirements.txt
+# Make sure to install dependencies first: python3 -m venv venv && source venv/bin/activate && python -m pip install -r requirements.txt
 
 echo "Starting audio separation process..."
 echo "Input file: sounds-examples/2025-10-25 13.54.36.ogg"
 echo ""
 
-# Run the audio separator with visualization
+# Activate virtual environment and run the audio separator with visualization
+source venv/bin/activate
 python audio_separator.py "sounds-examples/2025-10-25 13.54.36.ogg" -v -o output
 
 echo ""
